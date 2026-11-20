@@ -736,7 +736,7 @@ def shapley(t="daily"):
     n_bg = len(background) if t == "daily" else 100
     masker = shap.maskers.Independent(background, max_samples=n_bg)
     x_te = to_tensor(te, feats, stats).numpy()
-    explanation = shap.ExactExplainer(f, masker)(x_te)
+    explanation = shap.ExactExplainer(f, masker)(x_te, silent=True)
     phi, base = explanation.values, explanation.base_values
     gap = np.abs(phi.sum(1) + base - f(x_te)).max()
     values = pd.DataFrame(phi, index=te.index, columns=feats)
