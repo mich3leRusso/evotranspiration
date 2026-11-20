@@ -1,7 +1,8 @@
 """Masked autoencoder for the daily drivers of feature set 2 (step 1: pretraining).
 
-Run with `uv run evotranspiration-ae`. Figures go to figures/autoencoder, tables and the
-trained weights to results/autoencoder.
+Self-contained: needs only ARM_HH_2017_filled.csv in the same folder. Run with
+`python autoencoder.py`. Figures go to figures/autoencoder, tables and the trained weights to
+results/autoencoder, both next to this file.
 
 Plan (one step at a time)
     1. pretrain  : masked autoencoder on the daily feature-set-2 drivers of the training
@@ -35,6 +36,9 @@ days. Early stopping uses inner gaps (seed 1) cut into the training days.
 import json
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -42,13 +46,103 @@ import shap
 import torch
 from sklearn.linear_model import LinearRegression
 from torch import nn
+from xgboost import XGBRegressor
 
-from .modeling import GAP_LENGTHS_D, GAP_LENGTHS_HH, UNITS, artificial_gaps, load_datasets, scores, time_axis
-from .modeling import RES as MODEL_RES
-from .style import CAT, INK_2, NEUTRAL, save
+# Self-contained: everything is read from and written next to this file
+HERE = Path(__file__).resolve().parent
+DATA = HERE / "ARM_HH_2017_filled.csv"  # gap-filled half-hourly US-ARM 2017 (MDS)
+FIG = HERE / "figures" / "autoencoder"
+RES = HERE / "results" / "autoencoder"
 
-FIG = Path("figures/autoencoder")
-RES = Path("results/autoencoder")
+# ------------------------------------------------- settings shared with the XGBoost models
+UNITS = {"all": "W m⁻²", "daytime": "W m⁻²", "nighttime": "W m⁻²", "daily": "MJ m⁻² d⁻¹"}
+W_TO_MJ_DAY = 0.0864              # mean W m-2 over a day -> MJ m-2 d-1
+GAP_FRACTION = 0.30               # artificial gaps (Moffat 2007 gap lengths)
+GAP_LENGTHS_HH = (576, 64, 8, 1)  # half-hours: long (12 d), medium, short, very short
+GAP_LENGTHS_D = (12, 1)           # days
+XGB_PARAMS = dict(n_estimators=500, learning_rate=0.05, max_depth=6, subsample=0.8,
+                  colsample_bytree=0.8, random_state=0, n_jobs=-1)
+# Feature set 2 per timescale (Spearman screen + RFE, Stapleton et al. 2022)
+FS2 = {
+    "all": "NETRAD CO2_F_MDS TS_F_MDS_4 TS_F_MDS_6 SWC_F_MDS_1 SWC_F_MDS_9 H",
+    "daytime": "NETRAD CO2_F_MDS TS_F_MDS_1 TS_F_MDS_6 SWC_F_MDS_1 SWC_F_MDS_9 H RECO",
+    "nighttime": "VPD_F USTAR RH NETRAD CO2_F_MDS TS_F_MDS_1 TS_F_MDS_2 TS_F_MDS_9 SWC_F_MDS_1 "
+                 "SWC_F_MDS_3 SWC_F_MDS_5 SWC_F_MDS_7 G H RECO",
+    "daily": "WS_F RH NETRAD TS_F_MDS_2 TS_F_MDS_6 TS_F_MDS_9 SWC_F_MDS_1 SWC_F_MDS_3 SWC_F_MDS_5 "
+             "SWC_F_MDS_7 SWC_F_MDS_9 G H RECO",
+}
+
+# Plot style
+CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+INK, INK_2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
+NEUTRAL = "#a3a29e"
+plt.rcParams.update({
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
+    "axes.edgecolor": GRID, "axes.labelcolor": INK_2, "xtick.color": INK_2,
+    "ytick.color": INK_2, "axes.titlecolor": INK, "axes.titlelocation": "left",
+    "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True,
+    "grid.color": GRID, "grid.linewidth": 0.8, "legend.frameon": False,
+    "legend.labelcolor": INK_2, "font.size": 10,
+})
+
+
+def save(fig, path: Path, dpi=130):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ------------------------------------------------- data loading and gaps (as in the XGBoost models)
+def artificial_gaps(n: int, lengths, fraction=GAP_FRACTION, seed=0) -> np.ndarray:
+    """Gap length at each position (0 = not in a gap); gaps never touch each other."""
+    rng = np.random.default_rng(seed)
+    gap = np.zeros(n, int)
+
+    def place(L):
+        while True:
+            s = rng.integers(0, n - L + 1)
+            if not gap[max(s - 1, 0): s + L + 1].any():
+                gap[s: s + L] = L
+                return
+
+    for L in (L for L in lengths if L > 1):
+        for _ in range(round(fraction * n / len(lengths) / L)):
+            place(L)
+    while (gap > 0).sum() < round(fraction * n):
+        place(1)
+    return gap
+
+
+def to_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Daily means, precipitation summed."""
+    data = df.drop(columns=["TIMESTAMP_END"], errors="ignore")
+    daily = data.resample("D").mean()
+    if "P_F" in data:
+        daily["P_F"] = data["P_F"].resample("D").sum()
+    return daily
+
+
+def load_datasets(path=DATA) -> dict[str, pd.DataFrame]:
+    """Half-hourly and daily data per timescale, with the test-gap column `gap` (> 0 = test)."""
+    hh = pd.read_csv(path, index_col=0, parse_dates=["TIMESTAMP_START"])
+    hh["gap"] = artificial_gaps(len(hh), GAP_LENGTHS_HH)
+    daily = to_daily(hh.drop(columns=["NIGHT", "gap"]))
+    daily["LE"] *= W_TO_MJ_DAY
+    daily["gap"] = artificial_gaps(len(daily), GAP_LENGTHS_D)
+    return {"all": hh, "daytime": hh[hh.NIGHT == 0], "nighttime": hh[hh.NIGHT == 1], "daily": daily}
+
+
+def time_axis(t: str) -> str:
+    return "daily" if t == "daily" else "all"
+
+
+def scores(obs: pd.Series, pred) -> dict:
+    """Skill inside the gaps, in the units of LE."""
+    err = np.asarray(pred) - obs
+    return {"n_test": len(obs),
+            "R2": 1 - (err ** 2).sum() / ((obs - obs.mean()) ** 2).sum(),
+            "RMSE": np.sqrt((err ** 2).mean()), "MAE": err.abs().mean(), "bias": err.mean()}
 
 # Architecture and training (fixed, untuned)
 LATENT, HIDDEN = 8, 32  # 8 linear PCs explain 98.5 % of the variance of the 14 drivers (6 failed criterion a)
@@ -75,9 +169,8 @@ def rows(t: str) -> str:
 
 
 def features(t="daily") -> list[str]:
-    """Feature set 2 of timescale t as selected by the RFE in modeling.py."""
-    sel = pd.read_csv(MODEL_RES / "rfe_selected_fs2.csv", index_col=0)
-    return sel.loc[t, "features"].split()
+    """Feature set 2 of timescale t (RFE selection of the XGBoost models)."""
+    return FS2[t].split()
 
 
 def load(t="daily"):
@@ -296,8 +389,8 @@ def transfer(t="daily"):
             torch.save(head.state_dict(), RES / f"mlp_head{suffix(t)}.pt")
             (RES / f"mlp_head_config{suffix(t)}.json").write_text(json.dumps({"y_mean": y_mean, "y_std": y_std}))
 
-    xgb = pd.read_csv(MODEL_RES / f"predictions_fs2_{t}.csv", index_col=0, parse_dates=True)
-    preds["XGBoost feature set 2"] = xgb.loc[te.index, "pred"].to_numpy()
+    xgb = XGBRegressor(**XGB_PARAMS).fit(tr[feats], tr.LE)  # reference: XGBoost on the same features
+    preds["XGBoost feature set 2"] = xgb.predict(te[feats])
     out = te[["LE", "gap"]].rename(columns={"LE": "obs"}).assign(**preds)
     out.to_csv(RES / f"transfer_predictions{suffix(t)}.csv")
     table = pd.DataFrame([{"model": m, **scores(out.obs, out[m])} for m in preds]).round(3)
