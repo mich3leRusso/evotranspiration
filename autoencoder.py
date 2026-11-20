@@ -1,7 +1,7 @@
 """Masked autoencoder for the daily drivers of feature set 2 (step 1: pretraining).
 
-Self-contained: needs only ARM_HH_2017_filled.csv in the same folder. Run with
-`python autoencoder.py`. Figures go to figures/autoencoder, tables and the trained weights to
+Self-contained: needs only the raw ARM_HH_2017.csv in the same folder; preprocess()
+gap-fills it with MDS (Reichstein et al., 2005). Run with `python autoencoder.py`. Figures go to figures/autoencoder, tables and the trained weights to
 results/autoencoder, both next to this file.
 
 Plan (one step at a time)
@@ -50,7 +50,8 @@ from xgboost import XGBRegressor
 
 # Self-contained: everything is read from and written next to this file
 HERE = Path(__file__).resolve().parent
-DATA = HERE / "ARM_HH_2017_filled.csv"  # gap-filled half-hourly US-ARM 2017 (MDS)
+RAW = HERE / "ARM_HH_2017.csv"          # raw half-hourly FLUXNET file of US-ARM 2017 (the only input)
+DATA = HERE / "ARM_HH_2017_filled.csv"  # written by preprocess(): gap-filled with MDS
 FIG = HERE / "figures" / "autoencoder"
 RES = HERE / "results" / "autoencoder"
 
@@ -91,6 +92,170 @@ def save(fig, path: Path, dpi=130):
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
+
+
+# ------------------------------------------------- 0. preprocessing: MDS gap-filling
+# Marginal Distribution Sampling (Reichstein et al., 2005), as in the FLUXNET/ONEFlux pipeline:
+# a missing value = mean of observed values under similar meteorological conditions
+# (SW_IN, TA, VPD) within a growing time window; RH is rebuilt physically from TA and VPD.
+STEPS_PER_DAY = 48  # half-hourly data
+
+# Similarity tolerances (Reichstein et al., 2005)
+TOL_SW = 50.0   # W m-2
+TOL_TA = 2.5    # deg C
+TOL_VPD = 5.0   # hPa
+
+DRIVERS = ("SW_IN_F", "TA_F", "VPD_F")
+
+# Variables that need a non-mean aggregation from 30 min to 1 h
+SUM_VARS = ("P_F",)        # precipitation: mm per interval -> sum
+CIRCULAR_VARS = ("WD",)    # wind direction: filled through sine/cosine
+
+
+def load_dataset(path: str | Path) -> pd.DataFrame:
+    """Read the FLUXNET csv, parse timestamps and index by TIMESTAMP_START."""
+    df = pd.read_csv(path, na_values=["NaN", -9999, "-9999"])
+    for col in ("TIMESTAMP_START", "TIMESTAMP_END"):
+        df[col] = pd.to_datetime(df[col].astype(str), format="%Y%m%d%H%M")
+    df = df.set_index("TIMESTAMP_START")
+
+    step = pd.Timedelta(minutes=30)
+    if not (df.index.to_series().diff().dropna() == step).all():
+        raise ValueError("Time axis is not a regular 30-minute grid")
+    return df
+
+
+def _lut(values, observed, drivers, i, window_days, use_all):
+    """Look-up-table estimate for index i, or NaN if < 2 similar records."""
+    half = window_days * STEPS_PER_DAY
+    lo, hi = max(0, i - half), min(len(values), i + half + 1)
+    sel = observed[lo:hi].copy()
+    sw, ta, vpd = drivers
+    sel &= np.abs(sw[lo:hi] - sw[i]) < TOL_SW
+    if use_all:
+        sel &= np.abs(ta[lo:hi] - ta[i]) < TOL_TA
+        sel &= np.abs(vpd[lo:hi] - vpd[i]) < TOL_VPD
+    if sel.sum() < 2:
+        return np.nan
+    return values[lo:hi][sel].mean()
+
+
+def _mdc(values, observed, i, window_days):
+    """Mean-diurnal-course estimate: same time of day (+-1 h) within +-window days."""
+    offsets = []
+    for d in range(-window_days, window_days + 1):
+        for h in (-2, -1, 0, 1, 2):  # +-1 h in half-hour steps
+            if d == 0 and h == 0:
+                continue
+            offsets.append(d * STEPS_PER_DAY + h)
+    idx = i + np.array(offsets)
+    idx = idx[(idx >= 0) & (idx < len(values))]
+    idx = idx[observed[idx]]
+    if idx.size < 2:
+        return np.nan
+    return values[idx].mean()
+
+
+def _quality(method: str, window: int) -> int:
+    """Quality flag following the REddyProc convention."""
+    if (method in ("lut_all", "lut_sw") and window <= 14) or (method == "mdc" and window <= 1):
+        return 1
+    if (method == "lut_all" and window <= 28) or (method == "lut_sw" and window <= 28) or (
+        method == "mdc" and window <= 14
+    ):
+        return 2
+    return 3
+
+
+# Ordered list of (method, window in days) tried for each gap
+MDS_SCHEDULE = (
+    [("lut_all", 7), ("lut_all", 14), ("lut_sw", 7), ("mdc", 0), ("mdc", 1), ("mdc", 2)]
+    + [("lut_all", w) for w in range(21, 71, 7)]
+    + [("lut_sw", w) for w in range(14, 71, 7)]
+    + [("mdc", w) for w in range(7, 211, 7)]
+)
+
+
+def mds_fill_series(series: pd.Series, drivers: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Gap-fill one series with MDS.
+
+    Returns (filled series, quality flag series: 0 observed, 1-3 filled, NaN unfilled).
+    """
+    values = series.to_numpy(dtype=float)
+    observed = ~np.isnan(values)
+    drv = tuple(drivers[c].to_numpy(dtype=float) for c in DRIVERS)
+    if np.isnan(np.concatenate(drv)).any():
+        raise ValueError("MDS drivers must be gap-free")
+
+    filled = values.copy()
+    qc = np.where(observed, 0.0, np.nan)
+    for i in np.flatnonzero(~observed):
+        for method, window in MDS_SCHEDULE:
+            if method == "mdc":
+                est = _mdc(values, observed, i, window)
+            else:
+                est = _lut(values, observed, drv, i, window, use_all=(method == "lut_all"))
+            if not np.isnan(est):
+                filled[i] = est
+                qc[i] = _quality(method, window)
+                break
+    return (
+        pd.Series(filled, index=series.index, name=series.name),
+        pd.Series(qc, index=series.index, name=series.name),
+    )
+
+
+def rh_from_ta_vpd(ta: pd.Series, vpd: pd.Series) -> pd.Series:
+    """Relative humidity (%) from air temperature (degC) and VPD (hPa), Tetens formula."""
+    es = 6.1078 * np.exp(17.27 * ta / (ta + 237.3))
+    return (100 * (1 - vpd / es)).clip(0, 100)
+
+
+def gap_fill(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Gap-fill every numeric column that has gaps.
+
+    Columns that are entirely empty are dropped (nothing to learn from).
+    Wind direction is filled through its sine/cosine components.
+    Returns (filled dataframe, quality-flag dataframe).
+    """
+    df = df.copy()
+    empty = [c for c in df.columns if df[c].isna().all()]
+    df = df.drop(columns=empty)
+    if empty:
+        print(f"Dropped empty columns (no data to fill from): {empty}")
+
+    qc = pd.DataFrame(0.0, index=df.index, columns=df.columns)
+    drivers = df[list(DRIVERS)]
+    for col in df.columns:
+        if col == "TIMESTAMP_END" or not df[col].isna().any():
+            continue
+        if col == "RH":
+            # RH is fully determined by TA and VPD (validated: R2 > 0.9999 on
+            # observed data), which beats any statistical gap-filling.
+            gaps = df[col].isna()
+            df.loc[gaps, col] = rh_from_ta_vpd(df["TA_F"], df["VPD_F"])[gaps]
+            q = gaps.astype(float)
+        elif col in CIRCULAR_VARS:
+            rad = np.deg2rad(df[col])
+            s, q = mds_fill_series(np.sin(rad), drivers)
+            c, _ = mds_fill_series(np.cos(rad), drivers)
+            df[col] = np.rad2deg(np.arctan2(s, c)) % 360
+        else:
+            df[col], q = mds_fill_series(df[col], drivers)
+        qc[col] = q
+        print(f"{col:>12}: filled {int((q > 0).sum()):4d} values "
+              f"(qc1={int((q == 1).sum())}, qc2={int((q == 2).sum())}, qc3={int((q == 3).sum())})")
+    return df, qc
+
+
+def preprocess(raw=RAW, out=DATA) -> pd.DataFrame:
+    """Raw FLUXNET csv -> gap-filled half-hourly csv (the input of every later step)."""
+    df = load_dataset(raw)
+    print(f"Loaded {df.shape[0]} half-hours x {df.shape[1]} columns, {df.index[0]} -> {df.index[-1]}")
+    filled, _ = gap_fill(df)
+    filled.to_csv(out)
+    print(f"gap-filled data -> {out}")
+    return filled
 
 
 # ------------------------------------------------- data loading and gaps (as in the XGBoost models)
@@ -605,6 +770,7 @@ def plot_shapley(importance, t="daily", n_test=110, n_bg=255):
 
 def main():
     torch.set_num_threads(4)
+    preprocess()
     pretrain()
     transfer()
     attack()
